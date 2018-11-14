@@ -89,7 +89,7 @@ class SteeringToWheelVelWrapper(gym.ActionWrapper):
                  wheel_dist=0.102
                  ):
         gym.ActionWrapper.__init__(self, env)
-
+        import pdb; pdb.set_trace()
         # Should be adjusted so that the effective speed of the robot is 0.2 m/s
         self.gain = gain
 

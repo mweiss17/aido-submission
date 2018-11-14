@@ -1,238 +1,216 @@
-import functools
-import operator
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from replay_buffer import ReplayBuffer
+from PIL import Image
+import cv2
+import math
+from math import hypot
+from PIL import Image, ImageDraw
 
-device_type = "cuda" if torch.cuda.is_available() else "cpu"
-device = torch.device(device_type)
+RANDOM_SEED = 1234
+# Size of replay buffer
+BUFFER_SIZE = 10000
+MINIBATCH_SIZE = 64
 
+def draw_lines(img, lines, color=[255, 0, 0], thickness=3):
+    # If there are no lines to draw, exit.
+    if lines is None:
+        return
+    # Make a copy of the original image.
+    img = np.copy(img)
+    # Create a blank image that matches the original in size.
+    line_img = np.zeros(
+        (
+            img.shape[0],
+            img.shape[1],
+            3
+        ),
+        dtype=np.uint8,
+    )
+    # Loop over all lines and draw them on the blank image.
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            cv2.line(line_img, (x1, y1), (x2, y2), color, thickness)
+    # Merge the image with the lines onto the original.
+    img = cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0)
+    # Return the modified image.
+    return img
 
-# Implementation of Deep Deterministic Policy Gradients (DDPG)
-# Paper: https://arxiv.org/abs/1509.02971
+def average_slope_intercept(lines):
+    left_lines    = [] # (slope, intercept)
+    left_weights  = [] # (length,)
+    right_lines   = [] # (slope, intercept)
+    right_weights = [] # (length,)
 
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            if x2==x1:
+                continue # ignore a vertical line
+            slope = (y2-y1)/(x2-x1)
+            intercept = y1 - slope*x1
+            length = np.sqrt((y2-y1)**2+(x2-x1)**2)
+            if slope < 0: # y is reversed in image
+                left_lines.append((slope, intercept))
+                left_weights.append((length))
+            else:
+                right_lines.append((slope, intercept))
+                right_weights.append((length))
 
-class ActorDense(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
-        super(ActorDense, self).__init__()
+    # add more weight to longer lines
+    left_lane  = np.dot(left_weights,  left_lines) /np.sum(left_weights)  if len(left_weights) >0 else None
+    right_lane = np.dot(right_weights, right_lines)/np.sum(right_weights) if len(right_weights)>0 else None
 
-        state_dim = functools.reduce(operator.mul, state_dim, 1)
+    return left_lane, right_lane # (slope, intercept), (slope, intercept)
 
-        self.l1 = nn.Linear(state_dim, 400)
-        self.l2 = nn.Linear(400, 300)
-        self.l3 = nn.Linear(300, action_dim)
+def make_line_points(y1, y2, line):
+    """
+    Convert a line represented in slope and intercept into pixel points
+    """
+    if line is None:
+        return None
 
-        self.max_action = max_action
+    slope, intercept = line
 
-        self.tanh = nn.Tanh()
+    # make sure everything is integer as cv2.line requires it
+    x1 = int((y1 - intercept)/slope)
+    x2 = int((y2 - intercept)/slope)
+    y1 = int(y1)
+    y2 = int(y2)
 
-    def forward(self, x):
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = self.max_action * self.tanh(self.l3(x))
-        return x
+    return ((x1, y1), (x2, y2))
 
+def lane_lines(image, lines):
+    left_lane, right_lane = average_slope_intercept(lines)
 
-class ActorCNN(nn.Module):
-    def __init__(self, action_dim, max_action):
-        super(ActorCNN, self).__init__()
+    y1 = image.shape[0] # bottom of the image
+    y2 = y1*0.3         # slightly lower than the middle
 
-        # ONLY TRU IN CASE OF DUCKIETOWN:
-        flat_size = 32 * 9 * 14
+    left_line  = make_line_points(y1, y2, left_lane)
+    right_line = make_line_points(y1, y2, right_lane)
 
-        self.lr = nn.LeakyReLU()
-        self.tanh = nn.Tanh()
-        self.sigm = nn.Sigmoid()
-
-        self.conv1 = nn.Conv2d(3, 32, 8, stride=2)
-        self.conv2 = nn.Conv2d(32, 32, 4, stride=2)
-        self.conv3 = nn.Conv2d(32, 32, 4, stride=2)
-        self.conv4 = nn.Conv2d(32, 32, 4, stride=1)
-
-        self.bn1 = nn.BatchNorm2d(32)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.bn3 = nn.BatchNorm2d(32)
-        self.bn4 = nn.BatchNorm2d(32)
-
-        self.dropout = nn.Dropout(.5)
-
-        self.lin1 = nn.Linear(flat_size, 512)
-        self.lin2 = nn.Linear(512, action_dim)
-
-        self.max_action = max_action
-
-    def forward(self, x):
-        x = self.bn1(self.lr(self.conv1(x)))
-        x = self.bn2(self.lr(self.conv2(x)))
-        x = self.bn3(self.lr(self.conv3(x)))
-        x = self.bn4(self.lr(self.conv4(x)))
-        x = x.view(x.size(0), -1)  # flatten
-        x = self.dropout(x)
-        x = self.lr(self.lin1(x))
-
-        # this is the vanilla implementation
-        # but we're using a slightly different one
-        # x = self.max_action * self.tanh(self.lin2(x))
-
-        # because we don't want our duckie to go backwards
-        x = self.lin2(x)
-        x[:, 0] = self.max_action * self.sigm(x[:, 0])  # because we don't want the duckie to go backwards
-        x[:, 1] = self.tanh(x[:, 1])
-
-        return x
-
-
-class CriticDense(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(CriticDense, self).__init__()
-
-        state_dim = functools.reduce(operator.mul, state_dim, 1)
-
-        self.l1 = nn.Linear(state_dim, 400)
-        self.l2 = nn.Linear(400 + action_dim, 300)
-        self.l3 = nn.Linear(300, 1)
-
-    def forward(self, x, u):
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(torch.cat([x, u], 1)))
-        x = self.l3(x)
-        return x
+    return left_line, right_line
 
 
-class CriticCNN(nn.Module):
-    def __init__(self, action_dim):
-        super(CriticCNN, self).__init__()
-
-        flat_size = 32 * 9 * 14
-
-        self.lr = nn.LeakyReLU()
-
-        self.conv1 = nn.Conv2d(3, 32, 8, stride=2)
-        self.conv2 = nn.Conv2d(32, 32, 4, stride=2)
-        self.conv3 = nn.Conv2d(32, 32, 4, stride=2)
-        self.conv4 = nn.Conv2d(32, 32, 4, stride=1)
-
-        self.bn1 = nn.BatchNorm2d(32)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.bn3 = nn.BatchNorm2d(32)
-        self.bn4 = nn.BatchNorm2d(32)
-
-        self.dropout = nn.Dropout(.5)
-
-        self.lin1 = nn.Linear(flat_size, 256)
-        self.lin2 = nn.Linear(256 + action_dim, 128)
-        self.lin3 = nn.Linear(128, 1)
-
-    def forward(self, states, actions):
-        x = self.bn1(self.lr(self.conv1(states)))
-        x = self.bn2(self.lr(self.conv2(x)))
-        x = self.bn3(self.lr(self.conv3(x)))
-        x = self.bn4(self.lr(self.conv4(x)))
-        x = x.view(x.size(0), -1)  # flatten
-        x = self.lr(self.lin1(x))
-        x = self.lr(self.lin2(torch.cat([x, actions], 1)))  # c
-        x = self.lin3(x)
-
-        return x
+def draw_lane_lines(image, lines, thickness=2):
+    # make a separate image to draw lines and combine with the orignal later
+    line_image = np.zeros_like(image)
+    colors = [[255, 0, 0], [0, 255, 0]]
+    for idx, line in enumerate(lines):
+        cv2.line(line_image, line[0], line[1],  colors[idx], thickness)
+    return cv2.addWeighted(image, 1.0, line_image, 0.95, 0.0)
 
 
-class DDPG(object):
-    def __init__(self, state_dim, action_dim, max_action, net_type):
-        super(DDPG, self).__init__()
-        assert net_type in ["cnn", "dense"]
 
-        self.state_dim = state_dim
+def calc_distance_lane(points):
+    x1, y1, x2, y2 = deconstruct_lane_lines(points)
+    return math.hypot(x2-x1, y2-y1)
 
-        if net_type == "dense":
-            self.flat = True
-            self.actor = ActorDense(state_dim, action_dim, max_action).to(device)
-            self.actor_target = ActorDense(state_dim, action_dim, max_action).to(device)
-        else:
-            self.flat = False
-            self.actor = ActorCNN(action_dim, max_action).to(device)
-            self.actor_target = ActorCNN(action_dim, max_action).to(device)
+def calc_distance(x1, y1, x2, y2):
+    return math.hypot(x2-x1, y2-y1)
 
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+def deconstruct_lane_lines(points):
+    p1, p2 = points
+    x1, y1 = p1
+    x2, y2 = p2
+    return x1, y1, x2, y2
 
-        if net_type == "dense":
-            self.critic = CriticDense(state_dim, action_dim).to(device)
-            self.critic_target = CriticDense(state_dim, action_dim).to(device)
-        else:
-            self.critic = CriticCNN(action_dim).to(device)
-            self.critic_target = CriticCNN(action_dim).to(device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters())
+def slope(points):
+    x1, y1, x2, y2 = deconstruct_lane_lines(points)
+    return -((y2-y1)/(x2-x1))
+
+def angle_to_action(angle):
+    vel = .8
+    gain = 1
+    trim = 0
+    radius = 0.318
+    k = 27.0
+    wheel_dist =.102
+    limit = 1.0
+
+    # assuming same motor constants k for both motors
+    k_r = 1
+    k_l = 1
+
+    # adjusting k by gain and trim
+    k_r_inv = (gain + trim) / k_r
+    k_l_inv = (gain - trim) / k_l
+
+    omega_r = (vel + 0.5 * angle * wheel_dist) / radius
+    omega_l = (vel - 0.5 * angle * wheel_dist) / radius
+
+    # conversion from motor rotation rate to duty cycle
+    u_r = omega_r * k_r_inv
+    u_l = omega_l * k_l_inv
+
+    # limiting output to limit, which is 1.0 for the duckiebot
+    u_r_limited = max(min(u_r, limit), .3)
+    u_l_limited = max(min(u_l, limit), .3)
+    action = np.array([u_l_limited, u_r_limited])
+    return action
+
+class model:
+    def predict(self, observation, trial=0, step=0):
+        observation = (np.transpose(observation, (1, 2, 0)) * 255).astype('uint8')
+        i = Image.fromarray(observation, 'RGB')
+        #plt.figure()
+        #plt.imshow(i)
+
+        # Canny-ify
+        image = cv2.dilate(observation, None)
+        image = cv2.erode(image, None)
+        # plt.figure()
+        # plt.imshow(image)
+        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        r, thresh_image = cv2.threshold(gray_image, 127, 255, 1)
+        cannyed_image = cv2.Canny(thresh_image, 100, 200)
+        # plt.figure()
+        # plt.imshow(cannyed_image)
+
+        # Hough Lines
+
+        lines = cv2.HoughLinesP(cannyed_image, rho=1, theta=np.pi/180, threshold=10, minLineLength=20, maxLineGap=10)
+        if not lines:
+            return [1, 1]
+        #print(len(lines))
+        line_img = draw_lines(image, lines)
+        #plt.figure()
+        #plt.imshow(line_img)
+
+        # Lane Lines
+        print(lines)
+        lane_lines_image = Image.fromarray(draw_lane_lines(image, lane_lines(image, lines)), 'RGB')
+        # lane_lines_image.save("/tmp/some_img.jpg")
+        #plt.figure()
+        #plt.imshow(lane_lines_image)
+
+        # Slope Calulations
+        left_lane_line = lane_lines(image, lines)[0]
+        right_lane_line = lane_lines(image, lines)[1]
+        #left_length = calc_distance_lane(left_lane_line)
+        #right_length = calc_distance_lane(right_lane_line)
+        try:
+            left_slope = -math.atan(slope(left_lane_line)) *(180 / math.pi)
+            right_slope = -math.atan(slope(right_lane_line)) *(180 / math.pi)
+        except Exception:
+            return [1., 1.]
+        slope_to_use = right_slope
+        using_slope = "right"
+        if abs(left_slope) > abs(right_slope):
+            slope_to_use = left_slope
+            using_slope = "left"
+
+        print("angle: " + str(slope_to_use))
+        action = angle_to_action(slope_to_use)
+
+
+        d = ImageDraw.Draw(lane_lines_image)
+        d.text((10,10), "step: " + str(step), fill=(255,255,0))
+        d.text((10,20), "action: " + str(action), fill=(255,255,0))
+        d.text((10,40), "left_slope: " + str(left_slope), fill=(255,255,0))
+        d.text((10,50), "right_slope: " + str(right_slope), fill=(255,255,0))
+        d.text((10,60), "using_slope: " + str(using_slope), fill=(255,255,0))
+        lane_lines_image.save("/tmp/results/" + str(trial) + "/" + str(step) + "_lane_lines.jpg")
+
+        return action
 
     def close(self):
-        # TODO: release resources
         pass
-
-    def predict(self, state):
-        # just making sure the state has the correct format, otherwise the prediction doesn't work
-        assert state.shape[0] == 3
-
-        if self.flat:
-            state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-        else:
-            state = torch.FloatTensor(np.expand_dims(state, axis=0)).to(device)
-        return self.actor(state).cpu().data.numpy().flatten()
-
-    def train(self, replay_buffer, iterations, batch_size=64, discount=0.99, tau=0.001):
-        import pdb; pdb.set_trace()
-        for it in range(iterations):
-
-            # Sample replay buffer
-            sample = replay_buffer.sample(batch_size, flat=self.flat)
-            state = torch.FloatTensor(sample["state"]).to(device)
-            action = torch.FloatTensor(sample["action"]).to(device)
-            next_state = torch.FloatTensor(sample["next_state"]).to(device)
-            done = torch.FloatTensor(1 - sample["done"]).to(device)
-            reward = torch.FloatTensor(sample["reward"]).to(device)
-
-            # Compute the target Q value
-            target_Q = self.critic_target(next_state, self.actor_target(next_state))
-            target_Q = reward + (done * discount * target_Q).detach()
-
-            # Get current Q estimate
-            current_Q = self.critic(state, action)
-
-            # Compute critic loss
-            critic_loss = F.mse_loss(current_Q, target_Q)
-
-            # Optimize the critic
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
-
-            # Compute actor loss
-            actor_loss = -self.critic(state, self.actor(state)).mean()
-
-            # Optimize the actor
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-
-            # Update the frozen target models
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-    def save(self, filename, directory):
-        torch.save(self.actor.state_dict(), '{}/{}_actor.pth'.format(directory, filename))
-        torch.save(self.critic.state_dict(), '{}/{}_critic.pth'.format(directory, filename))
-
-    def load(self, filename, directory, for_inference=False):
-        #self.actor.load_state_dict(torch.load('{}/{}_actor.pth'.format(directory, filename), map_location=lambda storage, loc: storage))
-        #self.critic.load_state_dict(torch.load('{}/{}_critic.pth'.format(directory, filename), map_location=device))
-        if for_inference:
-            # If we're not learning anymore, set model layers to
-            # test mode (this disables dropout and changes batchnorm).
-            # This does NOT affect autograd.
-            self.actor.eval()
-            self.critic.eval()

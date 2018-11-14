@@ -12,6 +12,10 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
          python-tk && \
      rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update -y
+RUN apt-get install -y --no-install-recommends libglib2.0-0
+RUN apt-get install -y --no-install-recommends libsm6
+
 # let's create our workspace, we don't want to clutter the container
 RUN rm -r /workspace; mkdir /workspace
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-import torch
 import traceback
 
 import gym
@@ -33,7 +32,7 @@ def solve(params, cis):
     env = NormalizeWrapper(env)
     # to make the images pytorch-conv-compatible
     env = ImgWrapper(env)
-    env = ActionWrapper(env)
+    # env = ActionWrapper(env)
 
     # you ONLY need this wrapper if you trained your policy on [speed,steering angle]
     # instead [left speed, right speed]
@@ -48,46 +47,44 @@ def solve(params, cis):
     # HERE YOU NEED TO CREATE THE POLICY NETWORK SAME AS YOU DID IN THE TRAINING CODE
     # if you aren't using the DDPG baseline code, then make sure to copy your model
     # into the model.py file and that it has a model.predict(state) method.
-    from model import DDPG
+    import model
 
-    model = DDPG(state_dim=env.observation_space.shape, action_dim=2, max_action=1, net_type="cnn")
+    my_model = model.model()
 
     try:
-        model.load("model", "models", for_inference=True)
 
         # === END SUBMISSION ===
 
         # deactivate the automatic differentiation (i.e. the autograd engine, for calculating gradients)
-        with torch.no_grad():
-            # Then we make sure we have a connection with the environment and it is ready to go
-            cis.info('Reset environment')
-            observation = env.reset()
+        # Then we make sure we have a connection with the environment and it is ready to go
+        cis.info('Reset environment')
+        observation = env.reset()
 
-            # While there are no signal of completion (simulation done)
-            # we run the predictions for a number of episodes, don't worry, we have the control on this part
-            while True:
-                # we passe the observation to our model, and we get an action in return
-                action = model.predict(observation)
-                # we tell the environment to perform this action and we get some info back in OpenAI Gym style
-                observation, reward, done, info = env.step(action)
-                # here you may want to compute some stats, like how much reward are you getting
-                # notice, this reward may no be associated with the challenge score.
+        # While there are no signal of completion (simulation done)
+        # we run the predictions for a number of episodes, don't worry, we have the control on this part
+        while True:
+            # we passe the observation to our model, and we get an action in return
+            action = my_model.predict(observation, 0, 0)
+            # we tell the environment to perform this action and we get some info back in OpenAI Gym style
+            observation, reward, done, info = env.step(action)
+            # here you may want to compute some stats, like how much reward are you getting
+            # notice, this reward may no be associated with the challenge score.
 
-                # it is important to check for this flag, the Evalution Engine will let us know when should we finish
-                # if we are not careful with this the Evaluation Engine will kill our container and we will get no score
-                # from this submission
-                if 'simulation_done' in info:
-                    cis.info('simulation_done received.')
-                    break
-                if done:
-                    cis.info('Episode done; calling reset()')
-                    env.reset()
+            # it is important to check for this flag, the Evalution Engine will let us know when should we finish
+            # if we are not careful with this the Evaluation Engine will kill our container and we will get no score
+            # from this submission
+            if 'simulation_done' in info:
+                cis.info('simulation_done received.')
+                break
+            if done:
+                cis.info('Episode done; calling reset()')
+                env.reset()
 
     finally:
         # release CPU/GPU resources, let's be friendly with other users that may need them
         cis.info('Releasing resources')
         try:
-            model.close()
+            my_model.close()
         except:
             msg = 'Could not call model.close():\n%s' % traceback.format_exc()
             cis.error(msg)
